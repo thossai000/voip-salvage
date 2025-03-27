@@ -1,0 +1,25 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Benchmark results (can be regenerated)
+/results/*/
+
+# Generated files
+*.log
+
+# Editor configurations
+.vscode/
+.idea/
+
+# Environment files (should be set up locally)
+.env.local
+
+# Logs
+*.log

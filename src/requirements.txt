@@ -1,0 +1,17 @@
+# Core dependencies
+pyshark>=0.4.6    # For packet capture and analysis
+requests>=2.25.0  # For HTTP requests
+wave>=0.0.2       # For WAV file manipulation
+numpy>=1.19.0     # For audio processing
+
+# Network analysis
+scapy>=2.4.5      # For custom packet crafting and analysis
+# pyaudio>=0.2.11   # For audio I/O operations - removed as not used in current implementation
+
+# Command utilities
+python-ffmpeg>=1.0.16  # Python wrapper for FFmpeg
+
+# Optional dependencies
+matplotlib>=3.3.0  # For visualization (optional)
+pytest>=6.0.0      # For testing (development only)
+black>=21.5b2      # For code formatting (development only)

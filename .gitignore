@@ -1,0 +1,29 @@
+# Python environment
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Benchmark results
+/tmp/jitsi-results-*/
+results/
+
+# Generated files
+*.wav
+!audio/test_audio_30s.wav
+!audio/voip_ready.wav
+
+# IDE configurations
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment variables
+.env
+
+# Log files
+*.log
+
+# Custom presentation notes for personal use
+PRESENTATION_GUIDE.md 
