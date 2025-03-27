@@ -1,195 +1,317 @@
+#!/usr/bin/env python3
 """
-Test suite for RTP and codec integration.
+Unit tests for the RTP codec integration.
 
-This module contains tests that verify the integration of RTP protocol
-with audio codecs in the VoIP benchmarking tool.
+These tests verify that the Opus codec can be properly used with RTP packets
+for sending and receiving audio data.
 """
 
 import os
-import pytest
-import tempfile
+import sys
 import wave
-import numpy as np
 import socket
+import tempfile
 import threading
 import time
-from typing import Tuple
+import pytest
+from pathlib import Path
 
-from voip_benchmark.codecs import get_codec
-from voip_benchmark.codecs.opus import OpusCodec
-from voip_benchmark.rtp.packet import RTPPacket
-from voip_benchmark.rtp.session import RTPSession
+# Add the parent directory to the path for importing
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from voip_benchmark.codecs.opus import OpusCodec, PAYLOAD_TYPE_OPUS
+from voip_benchmark.rtp.packet import create_rtp_packet, parse_rtp_header
+from voip_benchmark.rtp.sender import send_rtp_stream
+from voip_benchmark.rtp.receiver import receive_rtp_stream
+import logging
 
 
-def create_test_audio(sample_rate: int = 48000, channels: int = 1, 
-                      duration: float = 1.0) -> bytes:
-    """Create test audio data for testing.
+@pytest.fixture
+def logger():
+    """Set up a logger for testing."""
+    logger = logging.getLogger("test_logger")
+    logger.setLevel(logging.DEBUG)
     
-    Args:
-        sample_rate: Audio sample rate in Hz
-        channels: Number of audio channels
-        duration: Duration in seconds
+    # Clear any existing handlers
+    logger.handlers = []
+    
+    # Add a console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+
+@pytest.fixture
+def test_wav_file():
+    """Create a temporary test WAV file."""
+    # Create a temporary file
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+        temp_path = temp_file.name
+    
+    # Create a simple WAV file with silence
+    with wave.open(temp_path, 'wb') as wav_file:
+        # Configure WAV file
+        wav_file.setnchannels(1)  # Mono
+        wav_file.setsampwidth(2)  # 16 bits
+        wav_file.setframerate(8000)  # 8 kHz
         
-    Returns:
-        PCM audio data as bytes
-    """
-    # Generate sine wave at 440 Hz
-    samples = int(duration * sample_rate)
-    t = np.linspace(0, duration, samples, False)
-    tone = np.sin(2 * np.pi * 440 * t)
+        # Generate 1 second of silence (all zeros)
+        wav_file.writeframes(b'\x00\x00' * 8000)
     
-    # Scale to 16-bit range
-    tone = (tone * 32767).astype(np.int16)
+    # Return the path to the test file
+    yield temp_path
     
-    # Convert to bytes
-    if channels == 1:
-        return tone.tobytes()
-    else:
-        # Duplicate for stereo
-        stereo = np.column_stack([tone] * channels)
-        return stereo.tobytes()
+    # Clean up
+    os.unlink(temp_path)
+
+
+@pytest.fixture
+def test_output_wav():
+    """Create a temporary path for output WAV file."""
+    # Create a temporary file
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+        temp_path = temp_file.name
+    
+    # Return the path to the test file
+    yield temp_path
+    
+    # Clean up
+    if os.path.exists(temp_path):
+        os.unlink(temp_path)
 
 
 def test_rtp_packet_with_opus_payload():
     """Test creating an RTP packet with Opus-encoded payload."""
-    # Create test audio data
-    audio_data = create_test_audio(duration=0.1)  # Short audio clip
-    
-    # Initialize Opus codec
-    codec = OpusCodec(frame_size=960)  # 20ms at 48kHz
-    
-    # Encode audio
-    encoded_data = codec.encode(audio_data)
-    
-    # Create RTP packet with Opus payload
-    packet = RTPPacket(
-        payload_type=111,  # Dynamic payload type for Opus
-        payload=encoded_data,
-        sequence_number=1000,
-        timestamp=48000,  # 1 second at 48kHz
-        ssrc=0x12345678
+    # Create an Opus codec instance
+    codec = OpusCodec(
+        sample_rate=8000,
+        channels=1,
+        bitrate=16000,
+        frame_size=160  # 20ms at 8kHz
     )
     
-    # Check packet properties
-    assert packet.payload_type == 111
-    assert packet.payload == encoded_data
-    assert packet.sequence_number == 1000
-    assert packet.timestamp == 48000
-    assert packet.ssrc == 0x12345678
+    # Create a simple audio payload (silence)
+    pcm_data = b'\x00\x00' * 160  # 20ms of silence at 8kHz, 16-bit
     
-    # Convert to bytes and back
-    packet_bytes = packet.to_bytes()
-    parsed_packet = RTPPacket.from_bytes(packet_bytes)
+    # Encode with Opus
+    encoded_data = codec.encode(pcm_data)
     
-    # Check that the parsed packet matches the original
-    assert parsed_packet.payload_type == packet.payload_type
-    assert parsed_packet.payload == packet.payload
-    assert parsed_packet.sequence_number == packet.sequence_number
-    assert parsed_packet.timestamp == packet.timestamp
-    assert parsed_packet.ssrc == packet.ssrc
+    # Confirm encoding reduces data size
+    assert len(encoded_data) < len(pcm_data)
+    
+    # Create RTP packet with Opus payload
+    seq_num = 1000
+    timestamp = 160000
+    ssrc = 0x12345678
+    
+    packet = create_rtp_packet(
+        payload=encoded_data,
+        sequence_number=seq_num,
+        timestamp=timestamp,
+        ssrc=ssrc,
+        payload_type=PAYLOAD_TYPE_OPUS
+    )
+    
+    # Verify packet structure
+    assert len(packet) > len(encoded_data)  # Packet should include header + payload
+    
+    # Parse the packet header
+    header = parse_rtp_header(packet[:12])
+    
+    # Verify header fields
+    assert header['version'] == 2
+    assert header['payload_type'] == PAYLOAD_TYPE_OPUS
+    assert header['sequence_number'] == seq_num
+    assert header['timestamp'] == timestamp
+    assert header['ssrc'] == ssrc
+    
+    # Verify payload matches
+    extracted_payload = packet[12:]
+    assert extracted_payload == encoded_data
 
 
-def test_rtp_send_receive_with_opus():
-    """Test sending and receiving RTP packets with Opus-encoded audio."""
-    # Skip if running in CI environment without network support
-    if os.environ.get('CI', 'false').lower() == 'true':
-        pytest.skip("Skipping network test in CI environment")
+def test_rtp_send_receive_with_opus(test_wav_file, test_output_wav, logger):
+    """Test sending and receiving RTP packets with Opus codec."""
+    # Define test parameters
+    send_port = 12345
+    duration = 2  # seconds
     
-    # Create test audio data
-    audio_data = create_test_audio(duration=0.1)  # Short audio clip
+    # Define a threading event to signal completion
+    receive_complete = threading.Event()
     
-    # Initialize Opus codec
-    codec = OpusCodec(frame_size=960)  # 20ms at 48kHz
-    
-    # Encode audio
-    encoded_data = codec.encode(audio_data)
-    
-    # Set up RTP sessions
-    sender_session = RTPSession(local_port=12345)
-    receiver_session = RTPSession(local_port=12346)
-    
-    # Set remote endpoints
-    sender_session.set_remote_endpoint('127.0.0.1', 12346)
-    
-    # Create packet received event
-    packet_received = threading.Event()
-    received_packet = [None]  # Use a list to store the received packet
-    
-    # Define packet handler
-    def packet_handler(packet):
-        received_packet[0] = packet
-        packet_received.set()
-    
-    try:
-        # Open sessions
-        sender_session.open()
-        receiver_session.open()
-        
-        # Start receiving
-        receiver_session.start_receiving(packet_handler)
-        
-        # Send packet
-        sent_bytes = sender_session.send_packet(
-            payload=encoded_data,
-            payload_type=111  # Dynamic payload type for Opus
-        )
-        
-        # Wait for packet to be received
-        if not packet_received.wait(2.0):
-            pytest.fail("Packet not received within timeout")
-        
-        # Check received packet
-        assert received_packet[0] is not None
-        assert received_packet[0].payload_type == 111
-        assert received_packet[0].payload == encoded_data
-        
-        # Decode received audio
-        decoded_data = codec.decode(received_packet[0].payload)
-        
-        # Check that decoded data is not empty
-        assert len(decoded_data) > 0
-        
-    finally:
-        # Close sessions
-        sender_session.close()
-        receiver_session.close()
-
-
-def test_rtp_send_receive_compression_ratio():
-    """Test the compression ratio of audio sent over RTP with Opus."""
-    # Create test audio data
-    audio_data = create_test_audio(duration=1.0)  # 1 second audio
-    
-    # Initialize Opus codec with different bitrates
-    for bitrate in [8000, 24000, 64000]:
-        codec = OpusCodec(bitrate=bitrate, frame_size=960)  # 20ms at 48kHz
-        
-        # Encode audio
-        encoded_data = codec.encode(audio_data)
-        
-        # Calculate compression ratio
-        compression_ratio = len(encoded_data) / len(audio_data)
-        
-        # Expected compression ratio should approximately match bitrate
-        expected_ratio = bitrate / (48000 * 16 * 1)  # sample_rate * bit_depth * channels
-        
-        # Allow for some variation due to encoding overhead and packet headers
-        # Opus is very efficient, so we expect good compression
-        assert 0.01 < compression_ratio < 0.6
-        
-        # For lower bitrates, expect better compression
-        if bitrate == 8000:
-            assert compression_ratio < 0.15
-        elif bitrate == 64000:
-            assert compression_ratio < 0.4
+    # Define receiver thread function
+    def receive_thread():
+        try:
+            success, bytes_received, packets_received = receive_rtp_stream(
+                listen_port=send_port,
+                output_file=test_output_wav,
+                duration=duration,
+                codec_name='opus',
+                bitrate=16000,
+                logger=logger
+            )
+            # Signal completion
+            receive_complete.set()
             
-        # Verify that the compression ratio is roughly proportional to the bitrate
-        # This checks that the codec is properly honoring the bitrate setting
-        if bitrate == 24000:
-            ratio_24k = compression_ratio
-        elif bitrate == 8000:
-            ratio_8k = compression_ratio
+            # Additional assertions in the receiver thread
+            assert success, "RTP receiver reported failure"
+            assert bytes_received > 0, "No bytes received"
+            assert packets_received > 0, "No packets received"
+            assert os.path.exists(test_output_wav), "Output WAV file not created"
             
-    # The 24kbps ratio should be roughly 3x the 8kbps ratio
-    # Allow for some variation due to encoding efficiency differences
-    assert 1.5 < (ratio_24k / ratio_8k) < 4.0 
+        except Exception as e:
+            logger.error(f"Receiver thread error: {e}")
+            receive_complete.set()
+    
+    # Start receiver in a separate thread
+    receiver_thread = threading.Thread(target=receive_thread)
+    receiver_thread.daemon = True
+    receiver_thread.start()
+    
+    # Give receiver time to start
+    time.sleep(1)
+    
+    # Send RTP stream with Opus codec
+    success, bytes_sent, packets_sent = send_rtp_stream(
+        wav_file=test_wav_file,
+        dest_ip='127.0.0.1',
+        dest_port=send_port,
+        codec_name='opus',
+        bitrate=16000,
+        logger=logger
+    )
+    
+    # Wait for receiver to complete
+    receive_complete.wait(timeout=duration + 5)
+    
+    # Verify sender results
+    assert success, "RTP sender reported failure"
+    assert bytes_sent > 0, "No bytes sent"
+    assert packets_sent > 0, "No packets sent"
+    
+    # Verify output WAV file exists and has content
+    assert os.path.exists(test_output_wav), "Output WAV file not created"
+    assert os.path.getsize(test_output_wav) > 0, "Output WAV file is empty"
+    
+    # Verify WAV file format
+    with wave.open(test_output_wav, 'rb') as wav_out:
+        assert wav_out.getnchannels() == 1, "Expected mono audio"
+        assert wav_out.getsampwidth() == 2, "Expected 16-bit audio"
+        assert wav_out.getframerate() == 48000, "Expected 48kHz sample rate"
+        assert wav_out.getnframes() > 0, "No audio frames in output file"
+
+
+def test_rtp_send_receive_compression_ratio(test_wav_file, test_output_wav, logger):
+    """Test that using Opus codec reduces the amount of data sent over RTP."""
+    # Define test parameters
+    send_port = 12346
+    duration = 2  # seconds
+    
+    # First run without codec to get baseline
+    # Define a threading event to signal completion
+    receive_complete = threading.Event()
+    
+    # Define receiver thread function
+    def receive_thread_no_codec():
+        try:
+            success, bytes_received, packets_received = receive_rtp_stream(
+                listen_port=send_port,
+                output_file=test_output_wav,
+                duration=duration,
+                codec_name=None,  # No codec
+                logger=logger
+            )
+            # Signal completion
+            receive_complete.set()
+        except Exception as e:
+            logger.error(f"Receiver thread error: {e}")
+            receive_complete.set()
+    
+    # Start receiver in a separate thread
+    receiver_thread = threading.Thread(target=receive_thread_no_codec)
+    receiver_thread.daemon = True
+    receiver_thread.start()
+    
+    # Give receiver time to start
+    time.sleep(1)
+    
+    # Send RTP stream without codec
+    success_no_codec, bytes_sent_no_codec, packets_sent_no_codec = send_rtp_stream(
+        wav_file=test_wav_file,
+        dest_ip='127.0.0.1',
+        dest_port=send_port,
+        codec_name=None,  # No codec
+        logger=logger
+    )
+    
+    # Wait for receiver to complete
+    receive_complete.wait(timeout=duration + 5)
+    receive_complete.clear()
+    
+    # Now run with Opus codec
+    # Define receiver thread function with codec
+    def receive_thread_with_codec():
+        try:
+            success, bytes_received, packets_received = receive_rtp_stream(
+                listen_port=send_port,
+                output_file=test_output_wav,
+                duration=duration,
+                codec_name='opus',
+                bitrate=16000,
+                logger=logger
+            )
+            # Signal completion
+            receive_complete.set()
+        except Exception as e:
+            logger.error(f"Receiver thread error: {e}")
+            receive_complete.set()
+    
+    # Start receiver in a separate thread
+    receiver_thread = threading.Thread(target=receive_thread_with_codec)
+    receiver_thread.daemon = True
+    receiver_thread.start()
+    
+    # Give receiver time to start
+    time.sleep(1)
+    
+    # Send RTP stream with Opus codec
+    success_with_codec, bytes_sent_with_codec, packets_sent_with_codec = send_rtp_stream(
+        wav_file=test_wav_file,
+        dest_ip='127.0.0.1',
+        dest_port=send_port,
+        codec_name='opus',
+        bitrate=16000,
+        logger=logger
+    )
+    
+    # Wait for receiver to complete
+    receive_complete.wait(timeout=duration + 5)
+    
+    # Verify both tests were successful
+    assert success_no_codec, "RTP sender without codec reported failure"
+    assert success_with_codec, "RTP sender with codec reported failure"
+    
+    # Verify packets were sent in both cases
+    assert packets_sent_no_codec > 0, "No packets sent without codec"
+    assert packets_sent_with_codec > 0, "No packets sent with codec"
+    
+    # Calculate compression ratio
+    # The number of packets should be the same, but bytes should be fewer with codec
+    compression_ratio = bytes_sent_with_codec / bytes_sent_no_codec
+    
+    # Opus should provide significant compression
+    assert compression_ratio < 0.5, f"Expected at least 50% compression, got {compression_ratio*100:.1f}%"
+    
+    logger.info(f"Compression Test Results:")
+    logger.info(f"  Bytes sent without codec: {bytes_sent_no_codec}")
+    logger.info(f"  Bytes sent with codec: {bytes_sent_with_codec}")
+    logger.info(f"  Compression ratio: {compression_ratio:.4f} ({compression_ratio*100:.1f}%)")
+    logger.info(f"  Bandwidth savings: {(1-compression_ratio)*100:.1f}%")
+
+
+if __name__ == "__main__":
+    pytest.main(["-xvs", __file__])

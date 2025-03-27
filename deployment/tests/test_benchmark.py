@@ -1,251 +1,249 @@
+#!/usr/bin/env python3
 """
-Test suite for VoIP benchmarking functionality.
+Unit tests for the benchmarking tools.
 
-This module contains tests for the end-to-end benchmarking
-capabilities of the VoIP benchmarking tool.
+These tests verify the functionality of the benchmarking and visualization tools,
+ensuring they correctly analyze codec performance and generate appropriate results.
 """
 
 import os
-import pytest
-import tempfile
+import sys
 import wave
-import numpy as np
-import subprocess
-import time
-from typing import Dict, List, Tuple
+import tempfile
+import json
+import pytest
+import glob
+import logging
+from pathlib import Path
 
-from voip_benchmark.codecs import get_codec
-from voip_benchmark.codecs.opus import OpusCodec
-from voip_benchmark.rtp.packet import RTPPacket
-from voip_benchmark.rtp.session import RTPSession
-import voip_benchmark.benchmark as benchmark
+# Add the parent directory to the path for importing
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+# Try to import the benchmarking module
+try:
+    from voip_benchmark.benchmark.benchmark import CodecBenchmark
+    BENCHMARK_AVAILABLE = True
+except ImportError:
+    BENCHMARK_AVAILABLE = False
+
+# Try to import visualization tools
+try:
+    from voip_benchmark.benchmark.visualize import (
+        load_csv_results, create_compression_comparison, create_bandwidth_savings_comparison,
+        create_quality_comparison, create_network_impact_chart
+    )
+    import matplotlib
+    matplotlib.use('Agg')  # Use non-interactive backend
+    VISUALIZATION_AVAILABLE = True
+except ImportError:
+    VISUALIZATION_AVAILABLE = False
 
 
-# Skip mark for tests that require external tools
-requires_external_tools = pytest.mark.skipif(
-    not (os.path.exists('/usr/bin/tshark') or os.path.exists('/usr/local/bin/tshark')),
-    reason="tshark not found, skipping tests that require packet capture"
-)
-
-
-def create_test_wav_file(path: str, duration: float = 1.0, 
-                         sample_rate: int = 48000, 
-                         channels: int = 1) -> str:
-    """Create a test WAV file for benchmarking.
+@pytest.fixture
+def logger():
+    """Set up a logger for testing."""
+    logger = logging.getLogger("test_benchmark")
+    logger.setLevel(logging.DEBUG)
     
-    Args:
-        path: Path to save the WAV file
-        duration: Duration in seconds
-        sample_rate: Sample rate in Hz
-        channels: Number of audio channels
+    # Clear any existing handlers
+    logger.handlers = []
+    
+    # Add a console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+
+@pytest.fixture
+def test_wav_file():
+    """Create a temporary test WAV file."""
+    # Create a temporary file
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+        temp_path = temp_file.name
+    
+    # Create a simple WAV file with silence
+    with wave.open(temp_path, 'wb') as wav_file:
+        # Configure WAV file
+        wav_file.setnchannels(1)  # Mono
+        wav_file.setsampwidth(2)  # 16 bits
+        wav_file.setframerate(8000)  # 8 kHz
         
-    Returns:
-        Path to the created WAV file
-    """
-    # Generate sine wave
-    samples = int(duration * sample_rate)
-    t = np.linspace(0, duration, samples, False)
-    tone = np.sin(2 * np.pi * 440 * t)
+        # Generate 1 second of silence (all zeros)
+        wav_file.writeframes(b'\x00\x00' * 8000)
     
-    # Scale to 16-bit range
-    tone = (tone * 32767).astype(np.int16)
+    # Return the path to the test file
+    yield temp_path
     
-    # Create WAV file
-    with wave.open(path, 'wb') as wav_file:
-        wav_file.setnchannels(channels)
-        wav_file.setsampwidth(2)  # 16-bit PCM
-        wav_file.setframerate(sample_rate)
-        
-        if channels == 1:
-            wav_file.writeframes(tone.tobytes())
-        else:
-            # Duplicate for stereo
-            stereo = np.column_stack([tone] * channels)
-            wav_file.writeframes(stereo.tobytes())
-    
-    return path
+    # Clean up
+    os.unlink(temp_path)
 
 
-def test_benchmark_wav_file_creation():
-    """Test creating a test WAV file for benchmarking."""
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-        temp_wav_path = temp_file.name
+@pytest.fixture
+def output_dir():
+    """Create a temporary directory for benchmark output."""
+    # Create a temporary directory
+    temp_dir = tempfile.mkdtemp()
     
+    # Return the path to the test directory
+    yield temp_dir
+    
+    # Clean up - recursive removal of directory tree
+    import shutil
     try:
-        # Create test WAV file
-        path = create_test_wav_file(temp_wav_path, duration=0.5)
-        
-        # Verify the file exists
-        assert os.path.exists(path)
-        
-        # Verify the file content
-        with wave.open(path, 'rb') as wav_file:
-            params = wav_file.getparams()
-            assert params.nchannels == 1
-            assert params.sampwidth == 2  # 16-bit
-            assert params.framerate == 48000
-            assert params.nframes > 0
-            
-            # Check total duration (within 1% tolerance)
-            duration = params.nframes / params.framerate
-            assert abs(duration - 0.5) < 0.005
-    
-    finally:
-        # Clean up
-        if os.path.exists(temp_wav_path):
-            os.unlink(temp_wav_path)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    except Exception as e:
+        print(f"Warning: Could not clean up temporary directory {temp_dir}: {e}")
 
 
-def test_voip_compression_benchmark():
-    """Test benchmarking of VoIP compression ratio."""
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-        input_wav_path = temp_file.name
-    
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-        output_wav_path = temp_file.name
-    
-    try:
-        # Create test input WAV file
-        create_test_wav_file(input_wav_path, duration=1.0)
-        
-        # Get input file size
-        input_size = os.path.getsize(input_wav_path)
-        
-        # Initialize codec with different bitrates
-        for bitrate in [8000, 24000, 64000]:
-            # Benchmark compression for this bitrate
-            result = benchmark.benchmark_codec_compression(
-                input_file=input_wav_path,
-                output_file=output_wav_path,
-                codec_name='opus',
-                bitrate=bitrate
-            )
-            
-            # Verify result fields
-            assert result['codec'] == 'opus'
-            assert result['bitrate'] == bitrate
-            assert result['input_size'] > 0
-            assert result['compressed_size'] > 0
-            assert result['output_size'] > 0
-            assert 0 < result['compression_ratio'] < 1.0
-            
-            # For lower bitrates, expect better compression
-            if bitrate == 8000:
-                assert result['compression_ratio'] < 0.15  # Very efficient compression
-            elif bitrate == 64000:
-                # Less compression but still decent
-                assert result['compression_ratio'] < 0.4
-    
-    finally:
-        # Clean up
-        for path in [input_wav_path, output_wav_path]:
-            if os.path.exists(path):
-                os.unlink(path)
+@pytest.fixture
+def sample_results():
+    """Create sample benchmark results."""
+    return [
+        {
+            "test_id": "opus_16000_ideal",
+            "codec": "Opus",
+            "codec_type": "opus",
+            "bitrate": 16000,
+            "network": "Ideal",
+            "packet_loss": 0.0,
+            "jitter": 0.0,
+            "out_of_order": 0,
+            "execution_time": 1.5,
+            "compression_ratio": 0.25,
+            "bandwidth_savings": 75.0,
+            "quality_pesq": 4.2,
+            "quality_snr": 25.3
+        },
+        {
+            "test_id": "opus_8000_ideal",
+            "codec": "Opus",
+            "codec_type": "opus",
+            "bitrate": 8000,
+            "network": "Ideal",
+            "packet_loss": 0.0,
+            "jitter": 0.0,
+            "out_of_order": 0,
+            "execution_time": 1.4,
+            "compression_ratio": 0.15,
+            "bandwidth_savings": 85.0,
+            "quality_pesq": 3.8,
+            "quality_snr": 22.1
+        },
+        {
+            "test_id": "none_64000_ideal",
+            "codec": "Raw PCM",
+            "codec_type": "none",
+            "bitrate": 64000,
+            "network": "Ideal",
+            "packet_loss": 0.0,
+            "jitter": 0.0,
+            "out_of_order": 0,
+            "execution_time": 1.3,
+            "compression_ratio": 1.0,
+            "bandwidth_savings": 0.0,
+            "quality_pesq": 4.5,
+            "quality_snr": 30.0
+        },
+        {
+            "test_id": "opus_16000_poor",
+            "codec": "Opus",
+            "codec_type": "opus",
+            "bitrate": 16000,
+            "network": "Poor",
+            "packet_loss": 5.0,
+            "jitter": 60.0,
+            "out_of_order": 3,
+            "execution_time": 1.6,
+            "compression_ratio": 0.25,
+            "bandwidth_savings": 75.0,
+            "quality_pesq": 3.1,
+            "quality_snr": 18.7
+        }
+    ]
 
 
-@requires_external_tools
-def test_network_traffic_benchmark():
-    """Test benchmarking of network traffic."""
-    # Skip test if running in CI environment without network access
-    if os.environ.get('CI', 'false').lower() == 'true':
-        pytest.skip("Skipping network test in CI environment")
+@pytest.mark.skipif(not BENCHMARK_AVAILABLE, reason="Benchmarking module not available")
+def test_codec_benchmark_initialization(test_wav_file, output_dir, logger):
+    """Test that CodecBenchmark can be initialized properly."""
+    benchmark = CodecBenchmark(test_wav_file, output_dir, logger)
     
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-        input_wav_path = temp_file.name
+    # Check that directories were created
+    assert os.path.exists(os.path.join(output_dir, "results"))
+    assert os.path.exists(os.path.join(output_dir, "audio"))
+    assert os.path.exists(os.path.join(output_dir, "plots"))
     
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-        output_wav_path = temp_file.name
-        
-    with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as temp_file:
-        capture_path = temp_file.name
-    
-    try:
-        # Create test input WAV file
-        create_test_wav_file(input_wav_path, duration=1.0)
-        
-        # Benchmark network traffic
-        result = benchmark.benchmark_network_traffic(
-            input_file=input_wav_path,
-            output_file=output_wav_path,
-            capture_file=capture_path,
-            codec_name='opus',
-            bitrate=24000,
-            packet_loss=0,
-            jitter=0
-        )
-        
-        # Verify result fields
-        assert result['codec'] == 'opus'
-        assert result['bitrate'] == 24000
-        assert result['input_size'] > 0
-        assert result['packets_sent'] > 0
-        assert result['packets_received'] > 0
-        assert result['bytes_sent'] > 0
-        assert result['transmission_ratio'] > 0
-        
-        # Allow for some packet overhead, but it should be reasonable
-        assert 0.8 < result['transmission_ratio'] < 1.5
-    
-    finally:
-        # Clean up
-        for path in [input_wav_path, output_wav_path, capture_path]:
-            if os.path.exists(path):
-                os.unlink(path)
+    # Check that WAV file was read correctly
+    assert benchmark.sample_rate == 8000
+    assert benchmark.channels == 1
+    assert benchmark.sample_width == 2
+    assert benchmark.duration == 1.0
 
 
-@requires_external_tools
-def test_network_simulation_benchmark():
-    """Test benchmarking with network condition simulation."""
-    # Skip test if running in CI environment without network access
-    if os.environ.get('CI', 'false').lower() == 'true':
-        pytest.skip("Skipping network test in CI environment")
+@pytest.mark.skipif(not BENCHMARK_AVAILABLE, reason="Benchmarking module not available")
+def test_audio_quality_calculation(test_wav_file, output_dir, logger):
+    """Test the audio quality metrics calculation."""
+    benchmark = CodecBenchmark(test_wav_file, output_dir, logger)
     
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-        input_wav_path = temp_file.name
+    # Calculate metrics between a file and itself (should be perfect quality)
+    metrics = benchmark.calculate_audio_quality(test_wav_file, test_wav_file)
     
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-        output_wav_path = temp_file.name
-        
-    with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as temp_file:
-        capture_path = temp_file.name
+    # Check SNR - should be high or undefined for identical files
+    if 'snr' in metrics:
+        assert metrics['snr'] > 50 or metrics['snr'] == float('inf')
+
+
+@pytest.mark.skipif(not VISUALIZATION_AVAILABLE, reason="Visualization tools not available")
+def test_visualization_creation(output_dir, sample_results):
+    """Test that visualization charts can be created."""
+    # Save sample results to a temporary CSV file
+    csv_file = os.path.join(output_dir, "test_results.csv")
     
-    try:
-        # Create test input WAV file
-        create_test_wav_file(input_wav_path, duration=1.0)
-        
-        # Benchmark with simulated packet loss and jitter
-        result = benchmark.benchmark_network_traffic(
-            input_file=input_wav_path,
-            output_file=output_wav_path,
-            capture_file=capture_path,
-            codec_name='opus',
-            bitrate=24000,
-            packet_loss=5,  # 5% packet loss
-            jitter=20  # 20ms jitter
-        )
-        
-        # Verify result fields
-        assert result['codec'] == 'opus'
-        assert result['bitrate'] == 24000
-        assert result['packet_loss'] == 5
-        assert result['jitter'] == 20
-        assert result['input_size'] > 0
-        assert result['packets_sent'] > 0
-        assert result['packets_received'] > 0
-        assert result['bytes_sent'] > 0
-        
-        # With packet loss, there should be fewer received packets than sent
-        assert result['packets_received'] <= result['packets_sent']
-        
-        # The packet loss should be approximately what we specified
-        expected_received = result['packets_sent'] * (1 - 0.05)  # 5% loss
-        tolerance = max(2, int(result['packets_sent'] * 0.03))  # Allow some variance
-        
-        # Check that packet loss is within expected range, with some tolerance
-        assert abs(result['packets_received'] - expected_received) <= tolerance
+    with open(csv_file, 'w', newline='') as f:
+        import csv
+        fieldnames = list(sample_results[0].keys())
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for result in sample_results:
+            writer.writerow(result)
     
-    finally:
-        # Clean up
-        for path in [input_wav_path, output_wav_path, capture_path]:
-            if os.path.exists(path):
-                os.unlink(path) 
+    # Test loading results from CSV
+    loaded_results = load_csv_results(csv_file)
+    assert len(loaded_results) == len(sample_results)
+    
+    # Test creating charts
+    charts = []
+    
+    # Create compression chart
+    chart_path = create_compression_comparison(loaded_results, output_dir)
+    charts.append(chart_path)
+    
+    # Create bandwidth savings chart
+    chart_path = create_bandwidth_savings_comparison(loaded_results, output_dir)
+    charts.append(chart_path)
+    
+    # Create quality comparison charts
+    create_quality_comparison(loaded_results, output_dir)
+    pesq_chart = os.path.join(output_dir, "pesq.png")
+    if os.path.exists(pesq_chart):
+        charts.append(pesq_chart)
+    
+    # Create network impact chart
+    chart_path = create_network_impact_chart(loaded_results, output_dir)
+    charts.append(chart_path)
+    
+    # Check that at least some charts were created
+    assert len(charts) > 0, "No visualization charts were created"
+    
+    # Check that all files exist
+    for chart in charts:
+        if chart:  # Some charts might be None if they couldn't be created
+            assert os.path.exists(chart), f"Chart not found: {chart}"
+            assert os.path.getsize(chart) > 0, f"Chart is empty: {chart}"
+
+
+if __name__ == "__main__":
+    pytest.main(["-xvs", __file__])

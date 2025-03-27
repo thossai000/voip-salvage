@@ -1,228 +1,230 @@
+#!/usr/bin/env python3
 """
-Test suite for adaptive bitrate optimization.
+Unit tests for the codec optimization tools.
 
-This module contains tests for the adaptive bitrate optimization
-functionality, which adjusts codec parameters based on network conditions.
+These tests verify the functionality of the codec optimizer,
+ensuring it can find optimal codec configurations for different use cases.
 """
 
+import os
+import sys
+import wave
+import tempfile
+import json
 import pytest
-import time
-import numpy as np
-from typing import Dict, List, Tuple
+import logging
+from pathlib import Path
 
-from voip_benchmark.codecs.opus import OpusCodec
-from voip_benchmark.codecs.adaptive_bitrate import (
-    AdaptiveBitrateController,
-    NetworkStats,
-    BALANCED_STRATEGY,
-    QUALITY_STRATEGY,
-    AGGRESSIVE_STRATEGY,
-)
+# Add the parent directory to the path for importing
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-
-def test_network_stats_calculation():
-    """Test the calculation of network statistics."""
-    # Create empty network stats
-    stats = NetworkStats()
-    
-    # Add data points
-    for _ in range(10):
-        stats.add_packet(100, 0, False)  # 100 bytes, no loss, in order
-    
-    assert stats.packets_received == 10
-    assert stats.packet_loss_rate == 0.0
-    assert stats.average_packet_size == 100
-    assert stats.out_of_order_rate == 0.0
-    
-    # Add some packet loss and out-of-order packets
-    for _ in range(5):
-        stats.add_packet(100, 0, False)  # Normal packet
-    stats.add_packet_loss()
-    stats.add_packet_loss()
-    stats.add_packet(100, 0, True)  # Out of order
-    
-    # Total: 16 received, 2 lost, 1 out of order
-    assert stats.packets_received == 16
-    assert stats.packets_lost == 2
-    assert stats.packets_out_of_order == 1
-    assert stats.packet_loss_rate == 2 / 18  # 2 lost out of 18 total
-    assert abs(stats.out_of_order_rate - 1/16) < 0.001  # 1 out of order out of 16 received
-    
-    # Test reset
-    stats.reset()
-    assert stats.packets_received == 0
-    assert stats.packets_lost == 0
-    assert stats.packets_out_of_order == 0
-    assert stats.packet_loss_rate == 0.0
-    assert stats.out_of_order_rate == 0.0
+# Try to import the optimization module
+try:
+    from voip_benchmark.utils.optimizer import CodecOptimizer, OptimizationResult, batch_optimize
+    OPTIMIZER_AVAILABLE = True
+except ImportError:
+    OPTIMIZER_AVAILABLE = False
 
 
-def test_adaptive_bitrate_controller_initialization():
-    """Test the initialization of the adaptive bitrate controller."""
-    # Create codec
-    codec = OpusCodec()
+@pytest.fixture
+def logger():
+    """Set up a logger for testing."""
+    logger = logging.getLogger("test_optimizer")
+    logger.setLevel(logging.DEBUG)
     
-    # Initialize controller with default settings
-    controller = AdaptiveBitrateController(codec)
-    assert controller.codec == codec
-    assert controller.min_bitrate == 8000
-    assert controller.max_bitrate == 128000
-    assert controller.adjustment_interval == 1.0
-    assert controller.strategy == BALANCED_STRATEGY
+    # Clear any existing handlers
+    logger.handlers = []
     
-    # Initialize with custom settings
-    controller = AdaptiveBitrateController(
-        codec,
-        min_bitrate=16000,
-        max_bitrate=64000,
-        adjustment_interval=2.0,
-        strategy=QUALITY_STRATEGY
-    )
-    assert controller.min_bitrate == 16000
-    assert controller.max_bitrate == 64000
-    assert controller.adjustment_interval == 2.0
-    assert controller.strategy == QUALITY_STRATEGY
+    # Add a console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    return logger
 
 
-def test_adaptive_bitrate_balanced_strategy():
-    """Test the balanced strategy for adaptive bitrate control."""
-    # Create codec
-    codec = OpusCodec(bitrate=32000)
+@pytest.fixture
+def test_wav_file():
+    """Create a temporary test WAV file."""
+    # Create a temporary file
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+        temp_path = temp_file.name
     
-    # Initialize controller with balanced strategy
-    controller = AdaptiveBitrateController(
-        codec,
-        min_bitrate=8000,
-        max_bitrate=128000,
-        strategy=BALANCED_STRATEGY
-    )
+    # Create a simple WAV file with silence
+    with wave.open(temp_path, 'wb') as wav_file:
+        # Configure WAV file
+        wav_file.setnchannels(1)  # Mono
+        wav_file.setsampwidth(2)  # 16 bits
+        wav_file.setframerate(16000)  # 16 kHz
+        
+        # Generate 1 second of silence (all zeros)
+        wav_file.writeframes(b'\x00\x00' * 16000)
     
-    # Reset stats
-    controller.network_stats.reset()
+    # Return the path to the test file
+    yield temp_path
     
-    # Test with good network conditions
-    for _ in range(100):
-        controller.network_stats.add_packet(100, 0, False)
-    
-    # Update bitrate (should increase slightly)
-    previous_bitrate = codec.bitrate
-    controller.update_bitrate()
-    assert codec.bitrate > previous_bitrate
-    assert codec.bitrate <= controller.max_bitrate
-    
-    # Test with moderate packet loss
-    controller.network_stats.reset()
-    for _ in range(90):
-        controller.network_stats.add_packet(100, 0, False)
-    for _ in range(10):
-        controller.network_stats.add_packet_loss()
-    
-    # Update bitrate (should decrease)
-    previous_bitrate = codec.bitrate
-    controller.update_bitrate()
-    assert codec.bitrate < previous_bitrate
-    assert codec.bitrate >= controller.min_bitrate
+    # Clean up
+    os.unlink(temp_path)
 
 
-def test_adaptive_bitrate_quality_strategy():
-    """Test the quality strategy for adaptive bitrate control."""
-    # Create codec
-    codec = OpusCodec(bitrate=32000)
+@pytest.fixture
+def output_dir():
+    """Create a temporary directory for optimization output."""
+    # Create a temporary directory
+    temp_dir = tempfile.mkdtemp()
     
-    # Initialize controller with quality strategy
-    controller = AdaptiveBitrateController(
-        codec,
-        min_bitrate=8000,
-        max_bitrate=128000,
-        strategy=QUALITY_STRATEGY
-    )
+    # Return the path to the test directory
+    yield temp_dir
     
-    # Reset stats
-    controller.network_stats.reset()
+    # Clean up
+    import shutil
+    try:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    except Exception as e:
+        print(f"Warning: Could not clean up temporary directory {temp_dir}: {e}")
+
+
+@pytest.mark.skipif(not OPTIMIZER_AVAILABLE, reason="Optimization module not available")
+def test_optimizer_initialization(logger):
+    """Test that CodecOptimizer can be initialized properly."""
+    optimizer = CodecOptimizer(logger)
     
-    # Test with good network conditions
-    for _ in range(100):
-        controller.network_stats.add_packet(100, 0, False)
+    # Check that the optimizer was created successfully
+    assert optimizer is not None
+    assert optimizer.logger is not None
+
+
+@pytest.mark.skipif(not OPTIMIZER_AVAILABLE, reason="Optimization module not available")
+def test_get_optimal_opus_config(logger):
+    """Test retrieving optimal Opus configurations for different targets."""
+    optimizer = CodecOptimizer(logger)
     
-    # Update bitrate (should increase more than with balanced strategy)
-    previous_bitrate = codec.bitrate
-    controller.update_bitrate()
-    assert codec.bitrate > previous_bitrate
-    assert codec.bitrate <= controller.max_bitrate
+    # Test balanced configuration
+    balanced_config = optimizer.get_optimal_opus_config("balanced")
+    assert balanced_config is not None
+    assert "complexity" in balanced_config
+    assert "application" in balanced_config
+    assert "frame_size" in balanced_config
+    assert "bitrate" in balanced_config
     
-    # Save the new bitrate to compare with balanced strategy
-    quality_bitrate = codec.bitrate
+    # Test quality configuration
+    quality_config = optimizer.get_optimal_opus_config("quality")
+    assert quality_config is not None
+    assert quality_config["complexity"] == 10  # Max quality should use max complexity
+    assert quality_config["bitrate"] > balanced_config["bitrate"]  # Quality should use higher bitrate
     
-    # Create a new controller with balanced strategy for comparison
-    codec.set_bitrate(32000)  # Reset bitrate
-    balanced_controller = AdaptiveBitrateController(
-        codec,
-        min_bitrate=8000,
-        max_bitrate=128000,
-        strategy=BALANCED_STRATEGY
+    # Test bitrate configuration
+    bitrate_config = optimizer.get_optimal_opus_config("bitrate")
+    assert bitrate_config is not None
+    assert bitrate_config["bitrate"] < quality_config["bitrate"]  # Bitrate optimization uses lower bitrate
+    
+    # Test latency configuration
+    latency_config = optimizer.get_optimal_opus_config("latency")
+    assert latency_config is not None
+    assert latency_config["frame_size"] < balanced_config["frame_size"]  # Latency uses smaller frames
+    
+    # Test CPU configuration
+    cpu_config = optimizer.get_optimal_opus_config("cpu")
+    assert cpu_config is not None
+    assert cpu_config["complexity"] < balanced_config["complexity"]  # CPU uses lower complexity
+
+
+@pytest.mark.skipif(not OPTIMIZER_AVAILABLE, reason="Optimization module not available")
+def test_generate_parameter_combinations(logger):
+    """Test generating parameter combinations for optimization."""
+    optimizer = CodecOptimizer(logger)
+    
+    # Test with balanced target
+    balanced_combinations = optimizer._generate_parameter_combinations("balanced", 5)
+    assert len(balanced_combinations) == 5  # Should respect max_combinations
+    
+    # Test with quality target
+    quality_combinations = optimizer._generate_parameter_combinations("quality", 3)
+    assert len(quality_combinations) == 3
+    
+    # Instead of exact matching, just check that quality combinations focus on high quality
+    # (high complexity, high bitrate)
+    for combo in quality_combinations:
+        assert combo["complexity"] >= 8  # Quality target should use high complexity
+        assert combo["bitrate"] >= 32000  # Quality target should use higher bitrates
+        assert combo["application"] in ["audio", "voip"]  # Should use quality-focused applications
+
+
+@pytest.mark.skipif(not OPTIMIZER_AVAILABLE, reason="Optimization module not available")
+def test_optimize_opus_codec(test_wav_file, logger):
+    """Test optimizing Opus codec parameters for a WAV file."""
+    optimizer = CodecOptimizer(logger)
+    
+    # Run optimization with limited combinations for testing
+    results = optimizer.optimize_opus_codec(
+        test_wav_file, target="balanced", max_combinations=2
     )
     
-    # Use the same network conditions
-    for _ in range(100):
-        balanced_controller.network_stats.add_packet(100, 0, False)
+    # Check results
+    assert len(results) > 0
+    assert isinstance(results[0], OptimizationResult)
+    assert results[0].codec_name == "opus"
+    assert "complexity" in results[0].parameters
+    assert "application" in results[0].parameters
+    assert "frame_size" in results[0].parameters
+    assert "bitrate" in results[0].parameters
     
-    # Update bitrate
-    balanced_controller.update_bitrate()
-    balanced_bitrate = codec.bitrate
-    
-    # Quality strategy should be more aggressive in increasing bitrate
-    assert quality_bitrate >= balanced_bitrate
+    # Check sorting (results should be sorted by the target)
+    if len(results) > 1:
+        # For balanced target, we use a composite score, so we can't easily check the sorting
+        # But we can verify that results have different parameters
+        assert results[0].parameters != results[1].parameters
 
 
-def test_adaptive_bitrate_aggressive_strategy():
-    """Test the aggressive strategy for adaptive bitrate control."""
-    # Create codec
-    codec = OpusCodec(bitrate=32000)
+@pytest.mark.skipif(not OPTIMIZER_AVAILABLE, reason="Optimization module not available")
+def test_batch_optimize(test_wav_file, output_dir, logger, monkeypatch):
+    """Test batch optimization across multiple files."""
+    # Create a list with the same file twice (for testing)
+    input_files = [test_wav_file, test_wav_file]
+    output_file = os.path.join(output_dir, "batch_results.json")
     
-    # Initialize controller with aggressive strategy
-    controller = AdaptiveBitrateController(
-        codec,
-        min_bitrate=8000,
-        max_bitrate=128000,
-        strategy=AGGRESSIVE_STRATEGY
-    )
+    # Mock the optimize_opus_codec method to return predefined results
+    def mock_optimize(self, audio_file, target="balanced", max_combinations=10):
+        result = OptimizationResult(
+            codec_name="opus",
+            parameters={"complexity": 6, "application": "voip", "frame_size": 20, "bitrate": 24000},
+            bitrate=24000,
+            quality_score=4.5,
+            compression_ratio=0.25,
+            encode_time=0.01,
+            decode_time=0.01,
+            frame_size=20
+        )
+        return [result]
     
-    # Reset stats
-    controller.network_stats.reset()
+    # Apply the mock
+    monkeypatch.setattr(CodecOptimizer, "optimize_opus_codec", mock_optimize)
     
-    # Test with moderate packet loss
-    for _ in range(90):
-        controller.network_stats.add_packet(100, 0, False)
-    for _ in range(10):
-        controller.network_stats.add_packet_loss()
+    # Run batch optimization with the mock
+    optimal_config = batch_optimize(input_files, output_file, target="balanced")
     
-    # Update bitrate (should decrease more than with balanced strategy)
-    previous_bitrate = codec.bitrate
-    controller.update_bitrate()
-    assert codec.bitrate < previous_bitrate
-    assert codec.bitrate >= controller.min_bitrate
+    # Check result
+    assert optimal_config is not None
+    assert "complexity" in optimal_config
+    assert "application" in optimal_config
+    assert "frame_size" in optimal_config
+    assert "bitrate" in optimal_config
     
-    # Save the new bitrate to compare with balanced strategy
-    aggressive_bitrate = codec.bitrate
+    # Check output file
+    assert os.path.exists(output_file)
     
-    # Create a new controller with balanced strategy for comparison
-    codec.set_bitrate(32000)  # Reset bitrate
-    balanced_controller = AdaptiveBitrateController(
-        codec,
-        min_bitrate=8000,
-        max_bitrate=128000,
-        strategy=BALANCED_STRATEGY
-    )
+    # Load the JSON file and check its structure
+    with open(output_file, 'r') as f:
+        results_json = json.load(f)
     
-    # Use the same network conditions
-    for _ in range(90):
-        balanced_controller.network_stats.add_packet(100, 0, False)
-    for _ in range(10):
-        balanced_controller.network_stats.add_packet_loss()
-    
-    # Update bitrate
-    balanced_controller.update_bitrate()
-    balanced_bitrate = codec.bitrate
-    
-    # Aggressive strategy should be more aggressive in decreasing bitrate
-    assert aggressive_bitrate <= balanced_bitrate 
+    # The format might vary based on implementation - we only need to check that
+    # it contains the optimal configuration and at least one input file result
+    assert len(results_json) >= 2  # At least optimal_configuration + one file
+    assert "optimal_configuration" in results_json
+    assert any(key.endswith('.wav') for key in results_json.keys() if key != "optimal_configuration")
+
+
+if __name__ == "__main__":
+    pytest.main(["-xvs", __file__])

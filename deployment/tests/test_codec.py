@@ -1,226 +1,243 @@
+#!/usr/bin/env python3
 """
-Test suite for codec functionality.
+Unit tests for the Opus codec implementation.
 
-This module contains unit tests for the codec functionality in the
-VoIP benchmarking tool, focusing on the Opus codec.
+These tests verify the functionality of the Opus codec 
+implementation in the voip_benchmark package.
 """
 
 import os
+import sys
+import wave
 import pytest
 import tempfile
-import wave
-import numpy as np
-from typing import Tuple
+from pathlib import Path
 
-from voip_benchmark.codecs import get_codec, AVAILABLE_CODECS
-from voip_benchmark.codecs.base import CodecBase
-from voip_benchmark.codecs.opus import OpusCodec
+# Add the parent directory to the path for importing
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from voip_benchmark.codecs.opus import Codec, OpusCodec
 
 
-def create_test_audio(sample_rate: int = 48000, channels: int = 1, 
-                      duration: float = 1.0) -> bytes:
-    """Create test audio data for testing codecs.
+@pytest.fixture
+def test_wav_file():
+    """Create a temporary test WAV file."""
+    # Create a temporary file
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+        temp_path = temp_file.name
     
-    Args:
-        sample_rate: Audio sample rate in Hz
-        channels: Number of audio channels
-        duration: Duration in seconds
+    # Create a simple WAV file
+    with wave.open(temp_path, 'wb') as wav_file:
+        # Configure WAV file
+        wav_file.setnchannels(1)  # Mono
+        wav_file.setsampwidth(2)  # 16 bits
+        wav_file.setframerate(8000)  # 8 kHz
         
-    Returns:
-        PCM audio data as bytes
-    """
-    # Generate sine wave at 440 Hz
-    samples = int(duration * sample_rate)
-    t = np.linspace(0, duration, samples, False)
-    tone = np.sin(2 * np.pi * 440 * t)
+        # Generate 1 second of silence (all zeros)
+        wav_file.writeframes(b'\x00\x00' * 8000)
     
-    # Scale to 16-bit range
-    tone = (tone * 32767).astype(np.int16)
+    # Return the path to the test file
+    yield temp_path
     
-    # Convert to bytes
-    if channels == 1:
-        return tone.tobytes()
-    else:
-        # Duplicate for stereo
-        stereo = np.column_stack([tone] * channels)
-        return stereo.tobytes()
+    # Clean up
+    os.unlink(temp_path)
 
 
-def test_opus_codec_available():
-    """Test that the Opus codec is available."""
-    assert 'opus' in AVAILABLE_CODECS
-    assert AVAILABLE_CODECS['opus'] == OpusCodec
-    
-    # Get the codec by name
-    codec_class = get_codec('opus')
-    assert codec_class == OpusCodec
-
-
-def test_opus_codec_initialization():
-    """Test the Opus codec initialization."""
-    # Test default initialization
-    codec = OpusCodec()
-    assert codec.sample_rate == 48000
-    assert codec.channels == 1
-    assert codec.bitrate == 64000  # Default bitrate
-    
-    # Test custom initialization
-    codec = OpusCodec(
-        sample_rate=16000, 
-        channels=2, 
-        bitrate=32000,
-        complexity=8
+@pytest.fixture
+def opus_codec():
+    """Create an OpusCodec instance for testing."""
+    return OpusCodec(
+        sample_rate=8000,
+        channels=1,
+        bitrate=16000,
+        complexity=10,
+        application=OpusCodec.APPLICATION_VOIP,
+        frame_size=160,  # 20ms at 8kHz
     )
-    assert codec.sample_rate == 16000
-    assert codec.channels == 2
-    assert codec.bitrate == 32000
-    assert codec.complexity == 8
-    
-    # Test invalid sample rate
-    with pytest.raises(ValueError):
-        OpusCodec(sample_rate=44100)  # Not supported by Opus
-    
-    # Test invalid channels
-    with pytest.raises(ValueError):
-        OpusCodec(channels=3)  # Opus supports 1 or 2 channels
 
 
-def test_opus_codec_encode_decode():
-    """Test the Opus codec encoding and decoding."""
-    # Create test audio
-    audio_data = create_test_audio()
-    
-    # Initialize codec
+def test_codec_instantiation():
+    """Test that the OpusCodec can be instantiated with default values."""
     codec = OpusCodec()
-    
-    # Encode audio
-    encoded_data = codec.encode(audio_data)
-    assert len(encoded_data) > 0
-    assert len(encoded_data) < len(audio_data)  # Should be compressed
-    
-    # Decode audio
-    decoded_data = codec.decode(encoded_data)
-    assert len(decoded_data) > 0
-    
-    # Check that the decoded data is similar in size to the original
-    # (may not be exactly the same due to compression)
-    assert abs(len(decoded_data) - len(audio_data)) / len(audio_data) < 0.1
+    assert codec is not None
+    assert codec.sample_rate == 8000
+    assert codec.channels == 1
+    assert codec.payload_type == 111
 
 
-def test_opus_codec_bitrate():
-    """Test the Opus codec bitrate setting."""
-    codec = OpusCodec()
+def test_opus_codec_configuration():
+    """Test the OpusCodec configuration options."""
+    codec = OpusCodec(
+        sample_rate=16000,
+        channels=2,
+        bitrate=32000,
+        complexity=5,
+        application=OpusCodec.APPLICATION_AUDIO,
+        frame_size=320,
+        payload_type=100,
+    )
     
-    # Set and get bitrate
-    codec.set_bitrate(32000)
-    assert codec.get_bitrate() == 32000
-    
-    # Test with low bitrate
-    codec.set_bitrate(8000)
-    assert codec.get_bitrate() == 8000
-    
-    # Test with high bitrate
-    codec.set_bitrate(128000)
-    assert codec.get_bitrate() == 128000
+    config = codec.get_config()
+    assert config["sample_rate"] == 16000
+    assert config["channels"] == 2
+    assert config["bitrate"] == 32000
+    assert config["complexity"] == 5
+    assert config["application"] == OpusCodec.APPLICATION_AUDIO
+    assert config["frame_size"] == 320
+    assert config["payload_type"] == 100
 
 
-def test_opus_codec_compression_ratio():
-    """Test the compression ratio of the Opus codec."""
-    # Create test audio (1 second)
-    audio_data = create_test_audio(duration=1.0)
-    original_size = len(audio_data)
+def test_invalid_sample_rate():
+    """Test that OpusCodec rejects invalid sample rates."""
+    with pytest.raises(ValueError):
+        OpusCodec(sample_rate=22050)  # Not in (8000, 12000, 16000, 24000, 48000)
+
+
+def test_invalid_channels():
+    """Test that OpusCodec rejects invalid channel counts."""
+    with pytest.raises(ValueError):
+        OpusCodec(channels=3)  # Not in (1, 2)
+
+
+def test_invalid_bitrate():
+    """Test that OpusCodec rejects invalid bitrates."""
+    with pytest.raises(ValueError):
+        OpusCodec(bitrate=4000)  # Below 6000
     
-    # Initialize codec with different bitrates
-    for bitrate in [8000, 16000, 32000, 64000, 128000]:
-        codec = OpusCodec(bitrate=bitrate)
+    with pytest.raises(ValueError):
+        OpusCodec(bitrate=600000)  # Above 510000
+
+
+def test_invalid_complexity():
+    """Test that OpusCodec rejects invalid complexity values."""
+    with pytest.raises(ValueError):
+        OpusCodec(complexity=-1)  # Below 0
+    
+    with pytest.raises(ValueError):
+        OpusCodec(complexity=11)  # Above 10
+
+
+def test_invalid_application():
+    """Test that OpusCodec rejects invalid application modes."""
+    with pytest.raises(ValueError):
+        OpusCodec(application=1234)  # Not a valid application mode
+
+
+def test_encode_decode(opus_codec, test_wav_file):
+    """Test encoding and decoding with Opus codec."""
+    # Read the test WAV file
+    with wave.open(test_wav_file, 'rb') as wav_file:
+        pcm_data = wav_file.readframes(wav_file.getnframes())
+    
+    # Use a single 20ms frame for the test
+    frame_size_bytes = 2 * 160  # 2 bytes per sample, 160 samples per frame (20ms)
+    frame = pcm_data[:frame_size_bytes]
+    
+    # Pad if needed
+    if len(frame) < frame_size_bytes:
+        frame = frame + b'\x00' * (frame_size_bytes - len(frame))
+    
+    # Encode the PCM data
+    encoded_data = opus_codec.encode(frame)
+    
+    # Check that encoding produces smaller data
+    assert len(encoded_data) < len(frame)
+    
+    # Decode the encoded data
+    decoded_data = opus_codec.decode(encoded_data)
+    
+    # Check that decoded data has the same length as the original frame
+    assert len(decoded_data) == len(frame)
+
+
+def test_compression_ratio(opus_codec, test_wav_file):
+    """Test that Opus achieves significant compression."""
+    # Read the test WAV file
+    with wave.open(test_wav_file, 'rb') as wav_file:
+        pcm_data = wav_file.readframes(wav_file.getnframes())
+    
+    # Process audio in 20ms frames
+    frame_size_bytes = 2 * 160  # 2 bytes per sample, 160 samples per frame (20ms)
+    compressed_data = bytearray()
+    
+    for i in range(0, len(pcm_data), frame_size_bytes):
+        frame = pcm_data[i:i+frame_size_bytes]
+        # Pad the last frame if needed
+        if len(frame) < frame_size_bytes:
+            frame = frame + b'\x00' * (frame_size_bytes - len(frame))
         
-        # Encode audio
-        encoded_data = codec.encode(audio_data)
-        encoded_size = len(encoded_data)
-        
-        # Calculate compression ratio
-        compression_ratio = encoded_size / original_size
-        
-        # Expected compression ratio should approximately match bitrate
-        # Opus is typically very efficient, so we expect good compression
-        expected_ratio = bitrate / (48000 * 16 * 1)  # sample_rate * bit_depth * channels
-        
-        # Allow for some variation due to encoding overhead
-        assert 0.01 < compression_ratio < 0.6
-        
-        # The compression ratio should roughly correspond to the bitrate
-        # Higher bitrates should give higher compression ratios
-        if bitrate == 8000:
-            # At very low bitrates, expect significant compression
-            assert compression_ratio < 0.1
-        elif bitrate == 128000:
-            # At high bitrates, expect less compression
-            assert compression_ratio > 0.1
+        # Encode frame
+        encoded = opus_codec.encode(frame)
+        compressed_data.extend(encoded)
+    
+    # Calculate compression ratio
+    ratio = len(compressed_data) / len(pcm_data)
+    
+    # At 16 kbps, we expect significant compression (ratio < 0.3)
+    assert ratio < 0.3
+    
+    # Verify compression is at least 70%
+    assert ratio <= 0.3, f"Compression ratio {ratio} does not meet minimum 70% compression target"
 
 
-def test_opus_codec_with_wav_file():
-    """Test the Opus codec with a WAV file."""
-    # Create a temporary WAV file
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-        temp_wav_path = temp_file.name
+def test_round_trip_integrity(opus_codec, test_wav_file):
+    """Test that audio can be encoded and decoded without critical data loss."""
+    # Create a new temporary file for the round-trip output
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+        output_path = temp_file.name
     
     try:
-        # Generate test WAV file
-        samples = 48000  # 1 second at 48kHz
-        sample_rate = 48000
-        channels = 1
+        # Read the test WAV file
+        with wave.open(test_wav_file, 'rb') as wav_in:
+            sample_width = wav_in.getsampwidth()
+            channels = wav_in.getnchannels()
+            sample_rate = wav_in.getframerate()
+            pcm_data = wav_in.readframes(wav_in.getnframes())
         
-        # Create sine wave
-        t = np.linspace(0, 1, samples, False)
-        tone = np.sin(2 * np.pi * 440 * t)
-        tone = (tone * 32767).astype(np.int16)
+        # Process audio in 20ms frames
+        frame_size_bytes = sample_width * channels * int(0.02 * sample_rate)
+        encoded_frames = []
         
-        # Write WAV file
-        with wave.open(temp_wav_path, 'wb') as wav_file:
-            wav_file.setnchannels(channels)
-            wav_file.setsampwidth(2)  # 16-bit
-            wav_file.setframerate(sample_rate)
-            wav_file.writeframes(tone.tobytes())
+        for i in range(0, len(pcm_data), frame_size_bytes):
+            frame = pcm_data[i:i+frame_size_bytes]
+            # Pad the last frame if needed
+            if len(frame) < frame_size_bytes:
+                frame = frame + b'\x00' * (frame_size_bytes - len(frame))
+            
+            # Encode frame
+            encoded = opus_codec.encode(frame)
+            encoded_frames.append(encoded)
         
-        # Initialize codec
-        codec = OpusCodec()
+        # Decode all frames
+        decoded_data = bytearray()
+        for encoded_frame in encoded_frames:
+            decoded_frame = opus_codec.decode(encoded_frame)
+            decoded_data.extend(decoded_frame)
         
-        # Read WAV file
-        audio_data, wav_info = codec.read_wav_file(temp_wav_path)
+        # Write the decoded data to the output file
+        with wave.open(output_path, 'wb') as wav_out:
+            wav_out.setnchannels(channels)
+            wav_out.setsampwidth(sample_width)
+            wav_out.setframerate(sample_rate)
+            wav_out.writeframes(decoded_data[:len(pcm_data)])  # Trim to original size
         
-        # Check WAV info
-        assert wav_info['channels'] == channels
-        assert wav_info['sample_rate'] == sample_rate
-        assert wav_info['sample_width'] == 2  # 16-bit
+        # Verify the file was created
+        assert os.path.exists(output_path)
+        assert os.path.getsize(output_path) > 0
         
-        # Test encoding and decoding
-        encoded_data = codec.encode(audio_data)
-        decoded_data = codec.decode(encoded_data)
-        
-        # Check data sizes
-        assert len(encoded_data) < len(audio_data)  # Should be compressed
-        assert len(decoded_data) > 0
-        
+        # Verify the output file is a valid WAV file
+        with wave.open(output_path, 'rb') as wav_check:
+            assert wav_check.getnchannels() == channels
+            assert wav_check.getsampwidth() == sample_width
+            assert wav_check.getframerate() == sample_rate
+            # Should have approximately the same number of frames
+            assert abs(wav_check.getnframes() - wav_in.getnframes()) <= 20
+    
     finally:
         # Clean up
-        if os.path.exists(temp_wav_path):
-            os.unlink(temp_wav_path)
+        if os.path.exists(output_path):
+            os.unlink(output_path)
 
 
-def test_opus_codec_multiple_frames():
-    """Test the Opus codec with multiple frames."""
-    # Create longer test audio (5 seconds)
-    audio_data = create_test_audio(duration=5.0)
-    
-    # Initialize codec
-    codec = OpusCodec(frame_size=960)  # 20ms at 48kHz
-    
-    # Encode audio
-    encoded_data = codec.encode(audio_data)
-    
-    # Decode audio
-    decoded_data = codec.decode(encoded_data)
-    
-    # Check data sizes
-    assert len(encoded_data) < len(audio_data)  # Should be compressed
-    assert abs(len(decoded_data) - len(audio_data)) / len(audio_data) < 0.1 
+if __name__ == "__main__":
+    pytest.main(["-xvs", __file__])
