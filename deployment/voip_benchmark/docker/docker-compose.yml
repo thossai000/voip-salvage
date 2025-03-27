@@ -1,0 +1,29 @@
+version: '3'
+
+services:
+  benchmark:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    volumes:
+      - ../results:/app/results
+      - ../audio:/app/audio
+    command: >
+      --input /app/audio/sample.wav
+      --output /app/results/output.wav
+      --codec opus
+      --bitrate 64000
+      --packet-loss 0.05
+      --jitter 20
+      --latency 80
+    environment:
+      - PYTHONUNBUFFERED=1
+  
+  # Service for running tests
+  test:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: pytest -xvs tests/
+    environment:
+      - PYTHONUNBUFFERED=1 

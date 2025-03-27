@@ -7,6 +7,7 @@ for VoIP benchmarking purposes.
 
 from voip_benchmark.codecs.base import CodecBase
 from voip_benchmark.codecs.opus import OpusCodec
+from voip_benchmark.codecs.adaptive_bitrate import AdaptiveBitrateController, AdaptiveBitrateStrategy
 
 # Dictionary of available codecs
 AVAILABLE_CODECS = {
