@@ -1,6 +1,6 @@
-# Jitsi VoIP Benchmarking System
+# Jitsi VoIP System
 
-A benchmarking system for evaluating VoIP codec performance with a focus on the Opus codec implementation with adaptive bitrate control.
+A system for evaluating VoIP codec performance with a focus on the Opus codec implementation with adaptive bitrate control.
 
 ## System Requirements
 
